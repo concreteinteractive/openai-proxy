@@ -1,10 +1,10 @@
-# Alpine docker image to run the go webserver on port 8080
-FROM golang:1.16-alpine
+# Use the official Golang image with Go 1.20 as a base image
+FROM golang:1.20-alpine
 
 # Set the Current Working Directory inside the container
 WORKDIR /app
 
-# Copy go mod and sum files
+# Copy go.mod and go.sum files
 COPY go.mod go.sum ./
 
 # Download all dependencies. Dependencies will be cached if the go.mod and go.sum files are not changed

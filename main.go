@@ -1,100 +1,194 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"io"
-	"os"
+    "bufio"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net/http"
+    "os"
+    "strings"
+    "time"
 
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
-	openai "github.com/sashabaranov/go-openai"
+    "github.com/gin-contrib/cors"
+    "github.com/gin-gonic/gin"
 )
 
-// MessageBody is the request body for the /message endpoint
-type MessageBody struct {
-	Messages []openai.ChatCompletionMessage `json:"messages"`
-}
-
-// StreamMessage is the message sent to the client via SSE
-type StreamMessage struct {
-	Timestamp int64  `json:"timestamp"`
-	Content   string `json:"content"`
-}
-
 func main() {
-	// Create a new Gin router
-	router := gin.Default()
+    router := gin.Default()
 
-	// Create Open AI client
-	apiKey := os.Getenv("OA_API_KEY")
-	client := openai.NewClient(apiKey)
+    // Configure CORS middleware
+    router.Use(cors.New(cors.Config{
+        AllowOrigins:     []string{"http://localhost:5721"},
+        AllowMethods:     []string{"POST", "OPTIONS"},
+        AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+        ExposeHeaders:    []string{"Content-Length"},
+        AllowCredentials: true,
+        MaxAge:           12 * time.Hour,
+    }))
 
-	// Apply CORS middleware
-	config := cors.DefaultConfig()
-	config.AllowAllOrigins = true
-	router.Use(cors.New(config))
+    router.POST("/message", func(c *gin.Context) {
+        var reqBody struct {
+            ThreadID string `json:"thread_id"`
+            Messages []struct {
+                Role    string `json:"role"`
+                Content string `json:"content"`
+            } `json:"messages"`
+        }
+        if err := c.ShouldBindJSON(&reqBody); err != nil {
+            c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+            return
+        }
 
-	// Resolver endpoints
-	router.POST("/message", func(c *gin.Context) {
-		// Receive messages from request body
-		var messageBody MessageBody
-		c.BindJSON(&messageBody)
+        fmt.Println("Received request:", reqBody)
 
-		// Create open ai chat completion request
-		req := openai.ChatCompletionRequest{
-			Model:    openai.GPT3Dot5Turbo,
-			Messages: messageBody.Messages,
-			Stream:   true,
-		}
+        apiKey := os.Getenv("OPENAI_API_KEY")
+        assistantID := os.Getenv("ASSISTANT_ID")
+        if apiKey == "" || assistantID == "" {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": "Missing API key or assistant ID"})
+            return
+        }
 
-		// As we receive messages from the Open AI Stream, we will send them to the client via this channel
-		stream := make(chan *StreamMessage, 10)
+        client := &http.Client{}
+        requestPayload := map[string]interface{}{
+            "assistant_id": assistantID,
+            "thread": map[string]interface{}{
+                "messages": reqBody.Messages,
+            },
+            "stream": true,
+        }
+        if reqBody.ThreadID != "" {
+            requestPayload["thread_id"] = reqBody.ThreadID
+        }
+        reqBodyBytes, _ := json.Marshal(requestPayload)
 
-		go func() {
-			// close the channel when we know we're done (when this go func exits)
-			defer close(stream)
-			// Stream the response as tokens are generated
-			openAIStream, err := client.CreateChatCompletionStream(context.Background(), req)
-			if err != nil {
-				fmt.Printf("ChatCompletionStream error: %v\n", err)
-				return
-			}
-			defer openAIStream.Close()
+        openaiAPIURL := "https://api.openai.com/v1/threads/runs"
+        fmt.Println("OpenAI API URL:", openaiAPIURL)
+        req, err := http.NewRequest("POST", openaiAPIURL, strings.NewReader(string(reqBodyBytes)))
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
 
-			for {
-				// Read chunks from the stream, as they become available
-				response, err := openAIStream.Recv()
-				if errors.Is(err, io.EOF) {
-					// fmt.Println("\nStream finished")
-					return
-				}
+        req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("OpenAI-Beta", "assistants=v2") // Add the required header for v2
 
-				if err != nil {
-					fmt.Printf("\nStream error: %v\n", err)
-					return
-				}
+        resp, err := client.Do(req)
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
+        defer resp.Body.Close()
 
-				// Send the response to the client
-				stream <- &StreamMessage{
-					Timestamp: response.Created,
-					Content:   response.Choices[0].Delta.Content,
-				}
-			}
-		}()
+        if resp.StatusCode != http.StatusOK {
+            var errorResponse struct {
+                Error struct {
+                    Message string `json:"message"`
+                    Type    string `json:"type"`
+                    Param   string `json:"param"`
+                    Code    string `json:"code"`
+                } `json:"error"`
+            }
+            json.NewDecoder(resp.Body).Decode(&errorResponse)
+            c.JSON(resp.StatusCode, gin.H{"error": errorResponse.Error})
+            return
+        }
 
-		// Stream the messages to the client
-		c.Stream(func(w io.Writer) bool {
-			// If there is a message in the stream, send it to the client
-			if msg, ok := <-stream; ok {
-				c.SSEvent("message", msg)
-				return true
-			}
-			return false
-		})
-	})
+        reader := bufio.NewReader(resp.Body)
+        var threadID string
 
-	// Start the server
-	router.Run(":8080")
+        c.Stream(func(w io.Writer) bool {
+            for {
+                line, err := reader.ReadString('\n')
+                if err != nil {
+                    if err == io.EOF {
+                        break
+                    }
+                    c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                    return false
+                }
+
+                fmt.Println("Received line:", line) // Print the raw data line
+
+                if strings.HasPrefix(line, "event: thread.run.created") {
+                    dataLine, err := reader.ReadString('\n')
+                    if err != nil {
+                        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                        return false
+                    }
+
+                    dataLine = strings.TrimPrefix(dataLine, "data: ")
+                    dataLine = strings.TrimSpace(dataLine)
+
+                    var runCreatedEvent struct {
+                        ThreadID string `json:"thread_id"`
+                    }
+                    err = json.Unmarshal([]byte(dataLine), &runCreatedEvent)
+                    if err != nil {
+                        fmt.Println("Unmarshal error:", err)
+                        fmt.Println("Data line:", dataLine)
+                        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                        return false
+                    }
+                    threadID = runCreatedEvent.ThreadID
+
+                    // Send the thread ID to the client immediately
+                    fmt.Fprintf(w, "{\"thread_id\":\"%s\"}\n", threadID)
+                    c.Writer.Flush()
+                }
+
+                if strings.HasPrefix(line, "event: thread.message.delta") {
+                    dataLine, err := reader.ReadString('\n')
+                    if err != nil {
+                        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                        return false
+                    }
+
+                    if strings.HasPrefix(dataLine, "data: ") {
+                        dataLine = strings.TrimPrefix(dataLine, "data: ")
+                        dataLine = strings.TrimSpace(dataLine)
+
+                        fmt.Println("Processing data line:", dataLine) // Print the data line being processed
+
+                        var delta struct {
+                            Delta struct {
+                                Content []struct {
+                                    Index int `json:"index"`
+                                    Type  string `json:"type"`
+                                    Text  struct {
+                                        Value string `json:"value"`
+                                    } `json:"text"`
+                                } `json:"content"`
+                            } `json:"delta"`
+                        }
+
+                        err = json.Unmarshal([]byte(dataLine), &delta)
+                        if err != nil {
+                            fmt.Println("Unmarshal error:", err)
+                            fmt.Println("Data line:", dataLine)
+                            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                            return false
+                        }
+
+                        for _, content := range delta.Delta.Content {
+                            if content.Type == "text" {
+                                fmt.Fprintf(w, "%s", content.Text.Value)
+                                c.Writer.Flush()
+                            }
+                        }
+                    }
+                }
+
+                if strings.HasPrefix(line, "event: thread.run.completed") || strings.HasPrefix(line, "event: done") {
+                    // Close the connection after completion or when done
+                    c.Writer.Flush()
+                    return false
+                }
+            }
+            return true
+        })
+    })
+
+    router.Run(":8080")
 }
